@@ -966,6 +966,10 @@ struct VideoLayerView: UIViewRepresentable {
         pan.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
+        // In tablet touch mode the gesture handler deliberately does nothing,
+        // but by default it would still cancel the touches that the PC is
+        // supposed to receive as real contacts.
+        pan.cancelsTouchesInView = false
         view.addGestureRecognizer(pan)
 
         // Local cursor echo: position updates ride the ~2ms control path
@@ -1185,6 +1189,9 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         private var twoFingerActive = false
+        /// Tracks the transition into pen-down so already-sent finger contacts
+        /// can be cancelled before palm rejection starts ignoring them.
+        private var penWasActive = false
         private var lastPan = CGPoint.zero
         private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
         /// Multi-touch (tablet mode) contact ids and the last logged count.
@@ -1429,8 +1436,16 @@ struct VideoLayerView: UIViewRepresentable {
                     sendPencilAsTouch(phase, pencil, event)
                 }
             }
+            let penActive = inputEngine.hasActivePen
+            if penActive && !penWasActive {
+                // The pen just went down. Any finger contacts Windows already
+                // knows about must be lifted explicitly, or palm rejection
+                // leaves them pressed for the rest of the session.
+                receiver?.sendTouches([], cancelled: true)
+            }
+            penWasActive = penActive
             // Palm rejection: ignore resting fingers while the pen is down.
-            if !finger.isEmpty && !inputEngine.hasActivePen {
+            if !finger.isEmpty && !penActive {
                 send(phase, finger, event)
             }
         }
@@ -1532,7 +1547,11 @@ final class InputCaptureEngine: NSObject {
         guard let n = normalize?(loc) else { return }
         let (nx, ny) = (n.x, n.y)
 
-        let pressure = min(Double(touch.force), 1.0)
+        // UITouch.force runs 0...maximumPossibleForce (about 4.17 on Apple
+        // Pencil); the wire expects 0...1. Dividing by the maximum is what
+        // keeps the full stylus range instead of saturating around 24%.
+        let maxForce = max(Double(touch.maximumPossibleForce), 1.0)
+        let pressure = min(Double(touch.force) / maxForce, 1.0)
         let azimuth = Double(touch.azimuthAngle(in: view))
         let altitude = Double(touch.altitudeAngle)
 
@@ -1548,7 +1567,7 @@ final class InputCaptureEngine: NSObject {
             for c in event?.samples(for: touch) ?? [touch] {
                 guard let cn = normalize?(c.location(in: view)) else { continue }
                 emitPencil("move", x: cn.x, y: cn.y,
-                           pressure: min(Double(c.force), 1.0),
+                           pressure: min(Double(c.force) / max(Double(c.maximumPossibleForce), 1.0), 1.0),
                            azimuth: Double(c.azimuthAngle(in: view)),
                            altitude: Double(c.altitudeAngle))
             }

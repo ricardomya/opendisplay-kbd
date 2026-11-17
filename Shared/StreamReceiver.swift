@@ -169,6 +169,10 @@ final class StreamReceiver: ObservableObject {
     private var bytesThisWindow = 0
     private var stallsThisWindow = 0
     private var decodeFlushes = 0
+    /// After a flush the decoder has no references; drop P-frames until the
+    /// requested IDR/IRAP arrives instead of feeding it frames that cannot
+    /// decode (the sender has no periodic IDR).
+    private var waitingForIDR = false
     private var lastFrameAt: Date?
     private var frameIntervals: [Double] = []   // ring buffer, ms
     private let maxSamples = 120
@@ -490,6 +494,7 @@ final class StreamReceiver: ObservableObject {
             Log.info(paused ? "rendering paused (backgrounded)" : "rendering resumed")
             if !paused {
                 self.displayLayer.flush()
+                self.waitingForIDR = true
                 if self.connection?.state == .ready {
                     self.sendControl(["type": "kf"])
                 }
@@ -1036,6 +1041,7 @@ final class StreamReceiver: ObservableObject {
         lastFrameAt = nil
         frameIntervals.removeAll()
         decodeFlushes = 0
+        waitingForIDR = true
         // The normal AVSampleBufferDisplayLayer path must never inherit the
         // previous session's last frame. The cursor is a separate channel, so
         // retaining that image can otherwise look like a live desktop even
@@ -1419,6 +1425,7 @@ final class StreamReceiver: ObservableObject {
         }
 
         var vclNALUs: [Data] = []
+        var hasIDR = false
         for nalu in nalus {
             guard let first = nalu.first else { continue }
             if streamCodec == "hevc" {
@@ -1430,7 +1437,10 @@ final class StreamReceiver: ObservableObject {
                     if sps != nalu { sps = nalu; formatDesc = nil }
                 case 34:  // PPS
                     if pps != nalu { pps = nalu; formatDesc = nil }
-                case 0...31: vclNALUs.append(nalu)
+                case 0...31:
+                    // IRAP (BLA/IDR/CRA) restores references after a flush.
+                    if (16...23).contains((first >> 1) & 0x3F) { hasIDR = true }
+                    vclNALUs.append(nalu)
                 default: break  // AUD, SEI, and other non-picture NALUs
                 }
             } else {
@@ -1446,7 +1456,9 @@ final class StreamReceiver: ObservableObject {
                         formatDesc = nil
                     }
                 case 6: break                            // SEI — skip
-                default: vclNALUs.append(nalu)           // slice data
+                default:                                 // slice data
+                    if first & 0x1F == 5 { hasIDR = true }   // IDR slice
+                    vclNALUs.append(nalu)
                 }
             }
         }
@@ -1457,10 +1469,14 @@ final class StreamReceiver: ObservableObject {
             } else if streamCodec == "h264" {
                 buildFormatDescription(sps: sps, pps: pps)
             }
+            // The decoder has no references for the new format; if this frame
+            // is not an IDR, drop the following P-frames until one arrives.
+            waitingForIDR = true
+            requestKeyframeIfNeeded()
         }
         guard !vclNALUs.isEmpty else { return }
         // All slices of one wire frame go into ONE sample buffer.
-        enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
+        enqueueFrame(vclNALUs, isIDR: hasIDR, captureMs: captureMs, sendMs: sendMs)
     }
 
     private func buildFormatDescription(sps: Data, pps: Data) {
@@ -1533,12 +1549,17 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
-    private func enqueueFrame(_ nalus: [Data], captureMs: Double? = nil, sendMs: Double? = nil) {
+    private func enqueueFrame(_ nalus: [Data], isIDR: Bool,
+                              captureMs: Double? = nil, sendMs: Double? = nil) {
         guard let formatDesc else { return }
         // Backgrounded linger: hardware decode is off-limits there, so drop
         // frames at the door instead of feeding a failing display layer at
         // frame rate. setRenderingPaused(false) re-syncs with a keyframe.
         if renderingPaused { return }
+        if waitingForIDR {
+            guard isIDR else { return }
+            waitingForIDR = false
+        }
 
         // Build one AVCC buffer: each NALU prefixed with 4-byte big-endian length.
         var avcc = Data(capacity: nalus.reduce(0) { $0 + $1.count + 4 })
@@ -1603,7 +1624,15 @@ final class StreamReceiver: ObservableObject {
                 Log.info("display layer failed (\(String(describing: displayLayer.error))) — flushing")
                 decodeFlushes += 1
                 displayLayer.flush()
+                waitingForIDR = true
+                requestKeyframeIfNeeded()
             }
+            if waitingForIDR && !isIDR {
+                // After a flush a P-frame has no reference; wait for the IDR
+                // the sender was just asked for instead of failing every frame.
+                return
+            }
+            waitingForIDR = false
             displayLayer.enqueue(sample)
         }
 
@@ -1774,6 +1803,7 @@ final class StreamReceiver: ObservableObject {
             if decodeErrorCount % 60 == 1 {
                 Log.info("decode call error: \(status) (\(decodeErrorCount) total)")
             }
+            waitingForIDR = true
             requestKeyframeIfNeeded()
         }
     }
