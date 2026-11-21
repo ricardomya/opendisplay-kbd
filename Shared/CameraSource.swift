@@ -98,6 +98,13 @@ final class CameraSource: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate
         if !session.inputs.isEmpty {
             session.inputs.forEach { session.removeInput($0) }
         }
+        // The output is a single instance kept across starts; leaving it
+        // attached makes canAddOutput fail on the second start after an
+        // on-demand stop ("no camera", and the sender then serves a green
+        // frame). Detach whatever a previous start left behind.
+        if !session.outputs.isEmpty {
+            session.outputs.forEach { session.removeOutput($0) }
+        }
 
         let types: [AVCaptureDevice.DeviceType] = [.builtInWideAngleCamera, .builtInTrueDepthCamera]
         let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types,
