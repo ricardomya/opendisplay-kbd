@@ -115,9 +115,12 @@ final class AudioHub {
             return true
         }
         let now = Date().timeIntervalSince1970
+        // Throttle by rate, not by total count: a mic that failed three times
+        // must still revive when the consumer returns minutes later.
         if startFailures >= 3 && now - lastStartAttempt < 1 {
             return false
         }
+        if startFailures >= 3 { startFailures = 0 } // a fresh attempt each epoch
         lastStartAttempt = now
         do {
             try applyMode(voice: micRunning)
@@ -204,18 +207,16 @@ final class AudioHub {
             try? input.setVoiceProcessingEnabled(false)
             #endif
             voiceActive = false
-            // Keep playback alive and try again shortly: the sender only sends
-            // the enable flag on transitions, so a transient failure must not
-            // leave the meeting without a microphone.
-            if micRetries < 3 {
-                micRetries += 1
-                queue.asyncAfter(deadline: .now() + 2) { [weak self] in
-                    guard let self, self.micDesired, !self.micRunning, !self.paused else { return }
-                    self.startMicOnQueue()
-                }
-            } else {
-                micDesired = false
-                onMicState?(false, "unavailable")
+            // Keep playback alive and keep trying: the sender only sends the
+            // enable flag on transitions, so if the consumer comes back after
+            // a stop (meeting closed, then the mic-test pressed), nobody
+            // re-sends it — the engine must revive on its own. Retries are
+            // capped in rate, not in count (one attempt every 5 s).
+            micRetries += 1
+            queue.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self, self.micDesired, !self.micRunning, !self.paused else { return }
+                Log.info("mic: retrying capture (attempt \(self.micRetries))")
+                self.startMicOnQueue()
             }
             try? applyMode(voice: false)
         }
